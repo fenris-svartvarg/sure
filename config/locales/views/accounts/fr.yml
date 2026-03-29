@@ -1,8 +1,8 @@
 ---
 fr:
   accounts:
-     not_authorized: "Vous n'êtes pas autorisé à gérer ce compte"
-     account:
+    not_authorized: "Vous n'êtes pas autorisé à gérer ce compte"
+    account:
       edit: Modifier
       link_lunchflow: Lier avec Lunch Flow
       link_provider: Lier avec un fournisseur
