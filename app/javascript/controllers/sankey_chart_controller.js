@@ -25,6 +25,28 @@ export default class extends Controller {
     "var(--color-gray-400)": "#9E9E9E",
     "var(--color-gray-500)": "#737373"
   };
+  static SPLIT_ROLE_ORDER = {
+    income_sub: 10,
+    income: 20,
+    transfer_in: 30,
+    cash_flow: 40,
+    transfer_out: 50,
+    expense: 60,
+    expense_sub: 70,
+    surplus: 80,
+    other: 99
+  };
+  static SPLIT_LABEL_PRIORITY = {
+    cash_flow: 0,
+    transfer_in: 1,
+    transfer_out: 1,
+    income: 2,
+    expense: 2,
+    income_sub: 3,
+    expense_sub: 3,
+    surplus: 4,
+    other: 5
+  };
   static MIN_LABEL_SPACING = 28; // Minimum vertical space needed for labels (2 lines)
 
   connect() {
@@ -80,16 +102,73 @@ export default class extends Controller {
   }
 
   #generateSankeyData(nodes, links, width, height, nodePadding) {
+    if (!nodes.length || !links.length) return { nodes: [], links: [] };
+
     const margin = this.constructor.EXTENT_MARGIN;
+    const mappedNodes = nodes.map(d => ({ ...d }));
+    const mappedLinks = links.map(d => ({ ...d }));
+
     const sankeyGenerator = sankey()
       .nodeWidth(this.nodeWidthValue)
       .nodePadding(nodePadding)
       .extent([[margin, margin], [width - margin, height - margin]]);
 
+    const splitNodeComparator = this.#buildSplitNodeComparator(nodes);
+    if (splitNodeComparator) {
+      // Keep split links stably ordered without forcing custom node alignment.
+      sankeyGenerator.linkSort(this.#buildSplitLinkComparator(nodes));
+    }
+
     return sankeyGenerator({
-      nodes: nodes.map(d => ({ ...d })),
-      links: links.map(d => ({ ...d })),
+      nodes: mappedNodes,
+      links: mappedLinks,
     });
+  }
+
+  #buildSplitNodeComparator(nodes) {
+    const hasLaneOrdering = nodes.some(node => Number.isFinite(node?.lane_order));
+    if (!hasLaneOrdering) return null;
+
+    return (a, b) => {
+      const laneA = Number.isFinite(a?.lane_order) ? a.lane_order : Number.MAX_SAFE_INTEGER;
+      const laneB = Number.isFinite(b?.lane_order) ? b.lane_order : Number.MAX_SAFE_INTEGER;
+      if (laneA !== laneB) return laneA - laneB;
+
+      const roleA = this.constructor.SPLIT_ROLE_ORDER[a?.node_role] ?? this.constructor.SPLIT_ROLE_ORDER.other;
+      const roleB = this.constructor.SPLIT_ROLE_ORDER[b?.node_role] ?? this.constructor.SPLIT_ROLE_ORDER.other;
+      if (roleA !== roleB) return roleA - roleB;
+
+      return String(a?.name || "").localeCompare(String(b?.name || ""));
+    };
+  }
+
+  #buildSplitLinkComparator(nodes) {
+    return (a, b) => {
+      const sourceLaneA = this.#splitLaneOrderForEndpoint(a?.source, nodes);
+      const sourceLaneB = this.#splitLaneOrderForEndpoint(b?.source, nodes);
+      if (sourceLaneA !== sourceLaneB) return sourceLaneA - sourceLaneB;
+
+      const targetLaneA = this.#splitLaneOrderForEndpoint(a?.target, nodes);
+      const targetLaneB = this.#splitLaneOrderForEndpoint(b?.target, nodes);
+      if (targetLaneA !== targetLaneB) return targetLaneA - targetLaneB;
+
+      const sourceRoleA = this.#splitRoleOrderForEndpoint(a?.source, nodes);
+      const sourceRoleB = this.#splitRoleOrderForEndpoint(b?.source, nodes);
+      if (sourceRoleA !== sourceRoleB) return sourceRoleA - sourceRoleB;
+
+      return d3.descending(a?.value ?? 0, b?.value ?? 0);
+    };
+  }
+
+  #splitLaneOrderForEndpoint(endpoint, nodes) {
+    if (Number.isFinite(endpoint?.lane_order)) return endpoint.lane_order;
+    if (Number.isFinite(endpoint)) return nodes[endpoint]?.lane_order ?? Number.MAX_SAFE_INTEGER;
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  #splitRoleOrderForEndpoint(endpoint, nodes) {
+    const role = endpoint?.node_role || (Number.isFinite(endpoint) ? nodes[endpoint]?.node_role : null);
+    return this.constructor.SPLIT_ROLE_ORDER[role] ?? this.constructor.SPLIT_ROLE_ORDER.other;
   }
 
   #createGradients(svg, links) {
@@ -97,6 +176,10 @@ export default class extends Controller {
 
     links.forEach((link, i) => {
       const gradientId = this.#gradientId(link, i);
+      const isTransferFlow = link?.flow_type === "transfer_in" || link?.flow_type === "transfer_out";
+      const gradientOpacity = isTransferFlow ? 0.2 : 0.1;
+      const sourceColor = isTransferFlow ? link.color : link.source.color;
+      const targetColor = isTransferFlow ? link.color : link.target.color;
       const gradient = defs.append("linearGradient")
         .attr("id", gradientId)
         .attr("gradientUnits", "userSpaceOnUse")
@@ -105,11 +188,11 @@ export default class extends Controller {
 
       gradient.append("stop")
         .attr("offset", "0%")
-        .attr("stop-color", this.#colorWithOpacity(link.source.color));
+        .attr("stop-color", this.#colorWithOpacity(sourceColor, gradientOpacity));
 
       gradient.append("stop")
         .attr("offset", "100%")
-        .attr("stop-color", this.#colorWithOpacity(link.target.color));
+        .attr("stop-color", this.#colorWithOpacity(targetColor, gradientOpacity));
     });
   }
 
@@ -241,6 +324,10 @@ export default class extends Controller {
     return hiddenLabels;
   }
 
+  #isInDialog() {
+    return Boolean(this.element.closest("dialog"));
+  }
+
   // Calculate which labels should be hidden to prevent overlap
   #calculateHiddenLabels(nodes) {
     const hiddenLabels = new Set();
@@ -261,24 +348,46 @@ export default class extends Controller {
       // Sort by vertical position
       columnNodes.sort((a, b) => ((a.y0 + a.y1) / 2) - ((b.y0 + b.y1) / 2));
 
-      let lastVisibleY = Number.NEGATIVE_INFINITY;
+      let lastVisible = null;
 
       columnNodes.forEach(node => {
         const nodeY = (node.y0 + node.y1) / 2;
         const nodeHeight = node.y1 - node.y0;
+        const currentPriority = this.#labelPriority(node);
 
         if (isLargeGraph && nodeHeight > minSpacing * 1.5) {
-          lastVisibleY = nodeY;
-        } else if (nodeY - lastVisibleY < minSpacing) {
-          // Too close to previous visible label, hide this one
-          hiddenLabels.add(node.index);
-        } else {
-          lastVisibleY = nodeY;
+          lastVisible = { node, y: nodeY };
+          return;
         }
+
+        if (!lastVisible) {
+          lastVisible = { node, y: nodeY };
+          return;
+        }
+
+        if (nodeY - lastVisible.y < minSpacing) {
+          // If labels overlap, keep the higher-priority one for stable split-lane readability.
+          const lastPriority = this.#labelPriority(lastVisible.node);
+          if (currentPriority < lastPriority) {
+            hiddenLabels.add(lastVisible.node.index);
+            lastVisible = { node, y: nodeY };
+          } else {
+            hiddenLabels.add(node.index);
+          }
+          return;
+        }
+
+        lastVisible = { node, y: nodeY };
       });
     });
 
     return hiddenLabels;
+  }
+
+  #labelPriority(node) {
+    if (!Number.isFinite(node?.lane_order)) return 50;
+
+    return this.constructor.SPLIT_LABEL_PRIORITY[node?.node_role] ?? this.constructor.SPLIT_LABEL_PRIORITY.other;
   }
 
   #attachHoverEvents(linkPaths, nodeGroups, sankeyData, hiddenLabels) {
@@ -300,6 +409,7 @@ export default class extends Controller {
     const resetHover = () => {
       linkPaths.style("opacity", 1).style("filter", "none");
       nodeGroups.style("opacity", 1);
+
       // Restore hidden labels to hidden state
       nodeGroups.selectAll("text")
         .style("opacity", d => hiddenLabels.has(d.index) ? 0 : 1);
@@ -308,7 +418,7 @@ export default class extends Controller {
     linkPaths
       .on("mouseenter", (event, d) => {
         applyHover([d]);
-        this.#showTooltip(event, d.value, d.percentage);
+        this.#showTooltip(event, d.value, d.percentage, this.#linkTooltipTitle(d));
       })
       .on("mousemove", event => this.#updateTooltipPosition(event))
       .on("mouseleave", () => {
@@ -357,11 +467,19 @@ export default class extends Controller {
   #showTooltip(event, value, percentage, title = null) {
     if (!this.tooltip) this.#createTooltip();
 
-    const content = title
-      ? `${title}<br/>${this.#formatCurrency(value)} (${percentage || 0}%)`
-      : `${this.#formatCurrency(value)} (${percentage || 0}%)`;
+    const hasPercentage = percentage !== null && percentage !== undefined && percentage !== "" && Number.isFinite(Number(percentage));
+    const percentageValue = hasPercentage ? Number(percentage) : null;
+    const valueText = hasPercentage
+      ? `${this.#formatCurrency(value)} (${percentageValue}%)`
+      : `${this.#formatCurrency(value)}`;
+    const safeValueText = this.#escapeHtml(valueText);
+    const safeTitle = title ? this.#escapeHtml(title) : null;
 
-    const isInDialog = !!this.element.closest("dialog");
+    const content = safeTitle
+      ? `${safeTitle}<br/>${safeValueText}`
+      : safeValueText;
+
+    const isInDialog = this.#isInDialog();
     const x = isInDialog ? event.clientX : event.pageX;
     const y = isInDialog ? event.clientY : event.pageY;
 
@@ -377,7 +495,7 @@ export default class extends Controller {
 
   #updateTooltipPosition(event) {
     if (this.tooltip) {
-      const isInDialog = !!this.element.closest("dialog");
+      const isInDialog = this.#isInDialog();
       const x = isInDialog ? event.clientX : event.pageX;
       const y = isInDialog ? event.clientY : event.pageY;
 
@@ -403,5 +521,20 @@ export default class extends Controller {
       maximumFractionDigits: 2
     });
     return this.currencySymbolValue + formatted;
+  }
+
+  #linkTooltipTitle(link) {
+    const sourceName = link?.source?.name || "Source";
+    const targetName = link?.target?.name || "Destination";
+    return `${sourceName} -> ${targetName}`;
+  }
+
+  #escapeHtml(value) {
+    return String(value)
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
   }
 }

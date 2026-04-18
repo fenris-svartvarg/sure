@@ -3,6 +3,7 @@ require "securerandom"
 class Demo::Generator
   # @param seed [Integer, String, nil] Seed value used to initialise the internal PRNG. If nil, the ENV variable DEMO_DATA_SEED will
   #   be honoured and default to a random seed when not present.
+  # @param seed_global_rng [Boolean] When true, also seed Ruby's global RNG. Set to false in tests that should not mutate global RNG state.
   #
   # Initialising an explicit PRNG gives us repeatable demo datasets while still
   #   allowing truly random data when the caller does not care about
@@ -10,7 +11,7 @@ class Demo::Generator
   #   will also be seeded so that *all* random behaviour inside this object –
   #   including library helpers that rely on Ruby's global RNG – follow the
   #   same deterministic sequence.
-  def initialize(seed: ENV.fetch("DEMO_DATA_SEED", nil))
+  def initialize(seed: ENV.fetch("DEMO_DATA_SEED", nil), seed_global_rng: true)
     # Convert the seed to an Integer if one was provided, otherwise fall back
     # to a random, but memoised, seed so the generator instance can report it
     # back to callers when needed (e.g. for debugging a specific run).
@@ -25,7 +26,7 @@ class Demo::Generator
     # Also seed Ruby's global RNG so helpers that rely on it (e.g.
     # Array#sample, Kernel.rand in invoked libraries, etc.) remain
     # deterministic for the lifetime of this generator instance.
-    srand(@seed)
+    srand(@seed) if seed_global_rng
   end
 
   # Expose the seed so callers can reproduce a run if necessary.
@@ -935,21 +936,47 @@ class Demo::Generator
     end
 
     def create_transfer!(from_account, to_account, amount, name, date)
+      outflow_kind = transfer_outflow_kind(from_account: from_account, to_account: to_account)
+
       outflow = from_account.entries.create!(
-        entryable: Transaction.new,
+        entryable: Transaction.new(
+          kind: outflow_kind,
+          category: transfer_outflow_category(kind: outflow_kind, from_account: from_account)
+        ),
         amount: amount,
         name: name,
         currency: from_account.currency,
         date: date
       )
       inflow = to_account.entries.create!(
-        entryable: Transaction.new,
+        entryable: Transaction.new(kind: "funds_movement"),
         amount: -amount,
         name: name,
         currency: to_account.currency,
         date: date
       )
-      Transfer.create!(inflow_transaction: inflow.entryable, outflow_transaction: outflow.entryable)
+      Transfer.create!(
+        inflow_transaction: inflow.entryable,
+        outflow_transaction: outflow.entryable,
+        status: "confirmed"
+      )
+    end
+
+    def transfer_outflow_kind(from_account:, to_account:)
+      destination_is_investment = to_account.investment? || to_account.crypto?
+      source_is_investment = from_account.investment? || from_account.crypto?
+
+      if destination_is_investment && source_is_investment
+        "funds_movement"
+      else
+        Transfer.kind_for_account(to_account)
+      end
+    end
+
+    def transfer_outflow_category(kind:, from_account:)
+      return nil unless kind == "investment_contribution"
+
+      from_account.family.investment_contributions_category
     end
 
     def load_securities!
